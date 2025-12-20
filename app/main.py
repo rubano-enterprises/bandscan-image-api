@@ -8,7 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from .config import get_settings
 from .database import init_database
-from .routes import health, images, items, students, tokens, notifications
+from .routes import health, images, items, students, tokens, notifications, schools, requests
 from .services.queue_worker import queue_worker
 
 settings = get_settings()
@@ -66,6 +66,8 @@ app.include_router(items.router)
 app.include_router(students.router)
 app.include_router(tokens.router)
 app.include_router(notifications.router)
+app.include_router(schools.router)
+app.include_router(requests.router)
 
 
 @app.get("/")

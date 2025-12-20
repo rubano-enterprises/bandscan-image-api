@@ -92,6 +92,78 @@ CREATE INDEX IF NOT EXISTS idx_notifications_band ON notifications(band_id);
 CREATE INDEX IF NOT EXISTS idx_notifications_sent ON notifications(sent_at);
 """
 
+# SQL for schools table (replaces Master spreadsheet)
+CREATE_SCHOOLS_SQL = """
+CREATE TABLE IF NOT EXISTS schools (
+    band_id TEXT PRIMARY KEY,
+    student_list_spreadsheet_id TEXT NOT NULL,
+    logo_url TEXT,
+    short_name TEXT NOT NULL,
+    primary_color TEXT,
+    full_name TEXT,
+    admin_emails TEXT,
+    attendance_template_id TEXT,
+    inventory_sheet_id TEXT,
+    active_student_list TEXT DEFAULT 'FullBand',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+"""
+
+# SQL for school sheet mappings (replaces columns P, Q, R, S in Master)
+CREATE_SCHOOL_SHEETS_SQL = """
+CREATE TABLE IF NOT EXISTS school_sheets (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    band_id TEXT NOT NULL,
+    sheet_type TEXT NOT NULL,
+    sheet_id TEXT NOT NULL,
+    is_active INTEGER DEFAULT 0,
+    display_order INTEGER DEFAULT 0,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(band_id, sheet_type, sheet_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_school_sheets_band ON school_sheets(band_id);
+CREATE INDEX IF NOT EXISTS idx_school_sheets_type ON school_sheets(band_id, sheet_type);
+"""
+
+# SQL for students table (UID and auth code storage, linked by name)
+CREATE_STUDENTS_SQL = """
+CREATE TABLE IF NOT EXISTS students (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    band_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    uid TEXT,
+    student_code TEXT UNIQUE,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(band_id, name)
+);
+
+CREATE INDEX IF NOT EXISTS idx_students_uid ON students(uid);
+CREATE INDEX IF NOT EXISTS idx_students_code ON students(student_code);
+CREATE INDEX IF NOT EXISTS idx_students_band_name ON students(band_id, name);
+"""
+
+# SQL for student requests table (replaces Column J JSON)
+CREATE_STUDENT_REQUESTS_SQL = """
+CREATE TABLE IF NOT EXISTS student_requests (
+    id TEXT PRIMARY KEY,
+    band_id TEXT NOT NULL,
+    student_name TEXT NOT NULL,
+    request_type TEXT NOT NULL,
+    new_value TEXT NOT NULL,
+    status TEXT DEFAULT 'pending',
+    admin_response TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    resolved_at TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_student_requests_band ON student_requests(band_id);
+CREATE INDEX IF NOT EXISTS idx_student_requests_status ON student_requests(status);
+CREATE INDEX IF NOT EXISTS idx_student_requests_student ON student_requests(band_id, student_name);
+"""
+
 # Migration to add is_primary column if it doesn't exist
 MIGRATION_ADD_IS_PRIMARY = """
 ALTER TABLE images ADD COLUMN is_primary INTEGER DEFAULT 0;
@@ -109,6 +181,10 @@ async def init_database():
         await db.executescript(CREATE_REQUESTS_QUEUE_SQL)
         await db.executescript(CREATE_DEVICE_TOKENS_SQL)
         await db.executescript(CREATE_NOTIFICATIONS_SQL)
+        await db.executescript(CREATE_SCHOOLS_SQL)
+        await db.executescript(CREATE_SCHOOL_SHEETS_SQL)
+        await db.executescript(CREATE_STUDENTS_SQL)
+        await db.executescript(CREATE_STUDENT_REQUESTS_SQL)
         await db.commit()
 
         # Run migrations for existing databases
@@ -576,3 +652,410 @@ async def get_notification_by_id(notification_id: str) -> Optional[dict]:
         )
         row = await cursor.fetchone()
         return dict(row) if row else None
+
+
+# ============================================================================
+# School operations
+# ============================================================================
+
+async def get_school(band_id: str) -> Optional[dict]:
+    """Get a school by band_id."""
+    async with get_db() as db:
+        cursor = await db.execute(
+            "SELECT * FROM schools WHERE band_id = ?",
+            (band_id,)
+        )
+        row = await cursor.fetchone()
+        return dict(row) if row else None
+
+
+async def get_all_schools() -> List[dict]:
+    """Get all schools."""
+    async with get_db() as db:
+        cursor = await db.execute("SELECT * FROM schools ORDER BY short_name")
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
+
+
+async def upsert_school(
+    band_id: str,
+    student_list_spreadsheet_id: str,
+    short_name: str,
+    logo_url: Optional[str] = None,
+    primary_color: Optional[str] = None,
+    full_name: Optional[str] = None,
+    admin_emails: Optional[str] = None,
+    attendance_template_id: Optional[str] = None,
+    inventory_sheet_id: Optional[str] = None,
+    active_student_list: str = "FullBand",
+) -> dict:
+    """Insert or update a school."""
+    async with get_db() as db:
+        now = datetime.utcnow().isoformat()
+        await db.execute(
+            """
+            INSERT INTO schools (
+                band_id, student_list_spreadsheet_id, logo_url, short_name,
+                primary_color, full_name, admin_emails, attendance_template_id,
+                inventory_sheet_id, active_student_list, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(band_id) DO UPDATE SET
+                student_list_spreadsheet_id = excluded.student_list_spreadsheet_id,
+                logo_url = excluded.logo_url,
+                short_name = excluded.short_name,
+                primary_color = excluded.primary_color,
+                full_name = excluded.full_name,
+                admin_emails = excluded.admin_emails,
+                attendance_template_id = excluded.attendance_template_id,
+                inventory_sheet_id = excluded.inventory_sheet_id,
+                active_student_list = excluded.active_student_list,
+                updated_at = excluded.updated_at
+            """,
+            (band_id, student_list_spreadsheet_id, logo_url, short_name,
+             primary_color, full_name, admin_emails, attendance_template_id,
+             inventory_sheet_id, active_student_list, now, now)
+        )
+        await db.commit()
+    return await get_school(band_id)
+
+
+async def update_school(band_id: str, **kwargs) -> Optional[dict]:
+    """Update specific fields of a school."""
+    allowed_fields = {
+        'logo_url', 'short_name', 'primary_color', 'full_name',
+        'admin_emails', 'attendance_template_id', 'inventory_sheet_id',
+        'active_student_list', 'student_list_spreadsheet_id'
+    }
+    updates = {k: v for k, v in kwargs.items() if k in allowed_fields}
+    if not updates:
+        return await get_school(band_id)
+
+    async with get_db() as db:
+        set_clause = ", ".join(f"{k} = ?" for k in updates.keys())
+        set_clause += ", updated_at = ?"
+        params = list(updates.values()) + [datetime.utcnow().isoformat(), band_id]
+        await db.execute(
+            f"UPDATE schools SET {set_clause} WHERE band_id = ?",
+            params
+        )
+        await db.commit()
+    return await get_school(band_id)
+
+
+async def delete_school(band_id: str) -> bool:
+    """Delete a school and all related data."""
+    async with get_db() as db:
+        # Delete related data first
+        await db.execute("DELETE FROM school_sheets WHERE band_id = ?", (band_id,))
+        await db.execute("DELETE FROM students WHERE band_id = ?", (band_id,))
+        await db.execute("DELETE FROM student_requests WHERE band_id = ?", (band_id,))
+        cursor = await db.execute("DELETE FROM schools WHERE band_id = ?", (band_id,))
+        await db.commit()
+        return cursor.rowcount > 0
+
+
+# ============================================================================
+# School sheets operations
+# ============================================================================
+
+async def get_school_sheets(band_id: str, sheet_type: str) -> List[dict]:
+    """Get all sheets of a specific type for a school."""
+    async with get_db() as db:
+        cursor = await db.execute(
+            """
+            SELECT * FROM school_sheets
+            WHERE band_id = ? AND sheet_type = ?
+            ORDER BY display_order, created_at
+            """,
+            (band_id, sheet_type)
+        )
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
+
+
+async def get_active_bus_sheets(band_id: str) -> List[str]:
+    """Get active bus sheet IDs for a school."""
+    async with get_db() as db:
+        cursor = await db.execute(
+            """
+            SELECT sheet_id FROM school_sheets
+            WHERE band_id = ? AND sheet_type = 'bus' AND is_active = 1
+            ORDER BY display_order
+            """,
+            (band_id,)
+        )
+        rows = await cursor.fetchall()
+        return [row["sheet_id"] for row in rows]
+
+
+async def add_school_sheet(
+    band_id: str,
+    sheet_type: str,
+    sheet_id: str,
+    is_active: bool = False,
+    display_order: int = 0,
+) -> dict:
+    """Add a sheet to a school."""
+    async with get_db() as db:
+        now = datetime.utcnow().isoformat()
+        await db.execute(
+            """
+            INSERT INTO school_sheets (band_id, sheet_type, sheet_id, is_active, display_order, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(band_id, sheet_type, sheet_id) DO UPDATE SET
+                is_active = excluded.is_active,
+                display_order = excluded.display_order
+            """,
+            (band_id, sheet_type, sheet_id, 1 if is_active else 0, display_order, now)
+        )
+        await db.commit()
+        cursor = await db.execute(
+            "SELECT * FROM school_sheets WHERE band_id = ? AND sheet_type = ? AND sheet_id = ?",
+            (band_id, sheet_type, sheet_id)
+        )
+        row = await cursor.fetchone()
+        return dict(row) if row else None
+
+
+async def remove_school_sheet(band_id: str, sheet_type: str, sheet_id: str) -> bool:
+    """Remove a sheet from a school."""
+    async with get_db() as db:
+        cursor = await db.execute(
+            "DELETE FROM school_sheets WHERE band_id = ? AND sheet_type = ? AND sheet_id = ?",
+            (band_id, sheet_type, sheet_id)
+        )
+        await db.commit()
+        return cursor.rowcount > 0
+
+
+async def set_bus_sheet_active(band_id: str, sheet_id: str, is_active: bool) -> bool:
+    """Set the active status of a bus sheet."""
+    async with get_db() as db:
+        cursor = await db.execute(
+            """
+            UPDATE school_sheets SET is_active = ?
+            WHERE band_id = ? AND sheet_type = 'bus' AND sheet_id = ?
+            """,
+            (1 if is_active else 0, band_id, sheet_id)
+        )
+        await db.commit()
+        return cursor.rowcount > 0
+
+
+# ============================================================================
+# Student operations (UID and auth code storage)
+# ============================================================================
+
+async def get_student_by_name(band_id: str, name: str) -> Optional[dict]:
+    """Get a student by name."""
+    async with get_db() as db:
+        cursor = await db.execute(
+            "SELECT * FROM students WHERE band_id = ? AND name = ?",
+            (band_id, name)
+        )
+        row = await cursor.fetchone()
+        return dict(row) if row else None
+
+
+async def get_student_by_uid(band_id: str, uid: str) -> Optional[dict]:
+    """Get a student by NFC UID."""
+    async with get_db() as db:
+        cursor = await db.execute(
+            "SELECT * FROM students WHERE band_id = ? AND uid = ?",
+            (band_id, uid)
+        )
+        row = await cursor.fetchone()
+        return dict(row) if row else None
+
+
+async def get_student_by_code(band_id: str, student_code: str) -> Optional[dict]:
+    """Get a student by auth code."""
+    async with get_db() as db:
+        cursor = await db.execute(
+            "SELECT * FROM students WHERE band_id = ? AND student_code = ?",
+            (band_id, student_code)
+        )
+        row = await cursor.fetchone()
+        return dict(row) if row else None
+
+
+async def get_all_students(band_id: str) -> List[dict]:
+    """Get all students for a school."""
+    async with get_db() as db:
+        cursor = await db.execute(
+            "SELECT * FROM students WHERE band_id = ? ORDER BY name",
+            (band_id,)
+        )
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
+
+
+async def upsert_student(
+    band_id: str,
+    name: str,
+    uid: Optional[str] = None,
+    student_code: Optional[str] = None,
+) -> dict:
+    """Insert or update a student."""
+    async with get_db() as db:
+        now = datetime.utcnow().isoformat()
+        await db.execute(
+            """
+            INSERT INTO students (band_id, name, uid, student_code, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(band_id, name) DO UPDATE SET
+                uid = COALESCE(excluded.uid, students.uid),
+                student_code = COALESCE(excluded.student_code, students.student_code),
+                updated_at = excluded.updated_at
+            """,
+            (band_id, name, uid, student_code, now, now)
+        )
+        await db.commit()
+    return await get_student_by_name(band_id, name)
+
+
+async def update_student(band_id: str, name: str, **kwargs) -> Optional[dict]:
+    """Update specific fields of a student."""
+    allowed_fields = {'uid', 'student_code'}
+    updates = {k: v for k, v in kwargs.items() if k in allowed_fields}
+    if not updates:
+        return await get_student_by_name(band_id, name)
+
+    async with get_db() as db:
+        set_clause = ", ".join(f"{k} = ?" for k in updates.keys())
+        set_clause += ", updated_at = ?"
+        params = list(updates.values()) + [datetime.utcnow().isoformat(), band_id, name]
+        await db.execute(
+            f"UPDATE students SET {set_clause} WHERE band_id = ? AND name = ?",
+            params
+        )
+        await db.commit()
+    return await get_student_by_name(band_id, name)
+
+
+async def delete_student(band_id: str, name: str) -> bool:
+    """Delete a student."""
+    async with get_db() as db:
+        cursor = await db.execute(
+            "DELETE FROM students WHERE band_id = ? AND name = ?",
+            (band_id, name)
+        )
+        await db.commit()
+        return cursor.rowcount > 0
+
+
+async def check_student_code_exists(student_code: str) -> bool:
+    """Check if a student code already exists (globally unique)."""
+    async with get_db() as db:
+        cursor = await db.execute(
+            "SELECT 1 FROM students WHERE student_code = ?",
+            (student_code,)
+        )
+        row = await cursor.fetchone()
+        return row is not None
+
+
+# ============================================================================
+# Student request operations
+# ============================================================================
+
+async def create_student_request(
+    request_id: str,
+    band_id: str,
+    student_name: str,
+    request_type: str,
+    new_value: str,
+) -> dict:
+    """Create a new student request."""
+    async with get_db() as db:
+        now = datetime.utcnow().isoformat()
+        await db.execute(
+            """
+            INSERT INTO student_requests (id, band_id, student_name, request_type, new_value, status, created_at)
+            VALUES (?, ?, ?, ?, ?, 'pending', ?)
+            """,
+            (request_id, band_id, student_name, request_type, new_value, now)
+        )
+        await db.commit()
+        cursor = await db.execute(
+            "SELECT * FROM student_requests WHERE id = ?",
+            (request_id,)
+        )
+        row = await cursor.fetchone()
+        return dict(row) if row else None
+
+
+async def get_student_request(request_id: str) -> Optional[dict]:
+    """Get a student request by ID."""
+    async with get_db() as db:
+        cursor = await db.execute(
+            "SELECT * FROM student_requests WHERE id = ?",
+            (request_id,)
+        )
+        row = await cursor.fetchone()
+        return dict(row) if row else None
+
+
+async def get_student_requests(
+    band_id: str,
+    status: Optional[str] = None,
+    request_type: Optional[str] = None,
+    student_name: Optional[str] = None,
+    limit: int = 100,
+    offset: int = 0,
+) -> List[dict]:
+    """Get student requests with optional filters."""
+    async with get_db() as db:
+        query = "SELECT * FROM student_requests WHERE band_id = ?"
+        params = [band_id]
+
+        if status:
+            query += " AND status = ?"
+            params.append(status)
+        if request_type:
+            query += " AND request_type = ?"
+            params.append(request_type)
+        if student_name:
+            query += " AND student_name = ?"
+            params.append(student_name)
+
+        query += " ORDER BY created_at DESC LIMIT ? OFFSET ?"
+        params.extend([limit, offset])
+
+        cursor = await db.execute(query, params)
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
+
+
+async def resolve_student_request(
+    request_id: str,
+    status: str,
+    admin_response: Optional[str] = None,
+) -> Optional[dict]:
+    """Resolve a student request (approve or deny)."""
+    if status not in ('approved', 'denied'):
+        raise ValueError("Status must be 'approved' or 'denied'")
+
+    async with get_db() as db:
+        now = datetime.utcnow().isoformat()
+        await db.execute(
+            """
+            UPDATE student_requests
+            SET status = ?, admin_response = ?, resolved_at = ?
+            WHERE id = ?
+            """,
+            (status, admin_response, now, request_id)
+        )
+        await db.commit()
+    return await get_student_request(request_id)
+
+
+async def delete_student_request(request_id: str) -> bool:
+    """Delete (cancel) a student request."""
+    async with get_db() as db:
+        cursor = await db.execute(
+            "DELETE FROM student_requests WHERE id = ?",
+            (request_id,)
+        )
+        await db.commit()
+        return cursor.rowcount > 0

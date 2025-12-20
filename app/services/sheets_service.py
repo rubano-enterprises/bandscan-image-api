@@ -225,3 +225,99 @@ async def verify_uid_available(
             return False  # UID already in use
 
     return True
+
+
+async def find_student_row_by_name(
+    spreadsheet_id: str,
+    sheet_name: str,
+    student_name: str,
+) -> Optional[int]:
+    """
+    Find the row number for a student by name.
+    Returns 1-indexed row number or None if not found.
+    """
+    service = get_sheets_service()
+
+    # Read all names (Column A)
+    range_name = f"{sheet_name}!A:A"
+    result = service.spreadsheets().values().get(
+        spreadsheetId=spreadsheet_id,
+        range=range_name,
+    ).execute()
+
+    rows = result.get("values", [])
+
+    for i, row in enumerate(rows):
+        if i == 0:  # Skip header row
+            continue
+        if row and row[0] == student_name:
+            return i + 1  # 1-indexed
+
+    return None
+
+
+async def update_student_name(
+    spreadsheet_id: str,
+    sheet_name: str,
+    old_name: str,
+    new_name: str,
+) -> bool:
+    """
+    Update a student's name in the Sheet (Column A).
+    Used when approving nameChange requests.
+    Returns True if successful.
+    """
+    row = await find_student_row_by_name(spreadsheet_id, sheet_name, old_name)
+    if not row:
+        raise ValueError(f"Student '{old_name}' not found in sheet")
+
+    service = get_sheets_service()
+    range_name = f"{sheet_name}!A{row}"
+
+    service.spreadsheets().values().update(
+        spreadsheetId=spreadsheet_id,
+        range=range_name,
+        valueInputOption="RAW",
+        body={"values": [[new_name]]},
+    ).execute()
+
+    logger.info(f"Updated name in sheet row {row}: {old_name} -> {new_name}")
+
+    return True
+
+
+async def update_student_instrument(
+    spreadsheet_id: str,
+    sheet_name: str,
+    student_name: str,
+    new_instrument: str,
+) -> bool:
+    """
+    Update a student's instrument in the Sheet (Column B after migration).
+    Used when approving instrumentChange requests.
+    Returns True if successful.
+
+    Note: After migration, column layout is:
+    - A: Name
+    - B: Instrument (was C before migration)
+    """
+    row = await find_student_row_by_name(spreadsheet_id, sheet_name, student_name)
+    if not row:
+        raise ValueError(f"Student '{student_name}' not found in sheet")
+
+    service = get_sheets_service()
+    # Post-migration: instrument is in Column B
+    # Pre-migration: instrument is in Column C
+    # For now, use Column C (current layout), can be updated during migration
+    range_name = f"{sheet_name}!C{row}"
+
+    service.spreadsheets().values().update(
+        spreadsheetId=spreadsheet_id,
+        range=range_name,
+        valueInputOption="RAW",
+        body={"values": [[new_instrument]]},
+    ).execute()
+
+    logger.info(f"Updated instrument for {student_name} at row {row}: {new_instrument}")
+
+    return True
