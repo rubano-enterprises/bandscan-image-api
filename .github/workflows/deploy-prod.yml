@@ -1,0 +1,72 @@
+name: Deploy to Production
+
+on:
+  push:
+    branches:
+      - main
+      - master
+
+env:
+  NTFY_URL: https://ntfy.sh/rubano-enterprises-dev
+  SERVER_HOST: 4.20.69.2
+  SERVER_USER: theyllib
+  DEPLOY_PATH: /etc/containerconfigs/bandscan-image-api
+
+jobs:
+  deploy:
+    name: Deploy Image API
+    # Only run if commit message contains [prod] AND pushed by allowed user
+    if: |
+      contains(github.event.head_commit.message, '[prod]') &&
+      (github.actor == 'Yllib' || github.actor == 'claude[bot]' || github.actor == 'anthropics')
+    runs-on: self-hosted
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Deploy to server
+        run: |
+          ssh -i ~/.ssh/github_runner_key -o StrictHostKeyChecking=no $SERVER_USER@$SERVER_HOST << 'EOF'
+            cd /etc/containerconfigs/bandscan-image-api
+
+            # Pull latest changes from git
+            git fetch origin
+            git reset --hard origin/main || git reset --hard origin/master
+
+            # Rebuild and restart the container (using docker compose v2)
+            docker compose down
+            docker compose build --no-cache
+            docker compose up -d
+
+            # Wait for health check
+            echo "Waiting for container to be healthy..."
+            sleep 10
+
+            # Verify deployment
+            if docker compose ps | grep -q "Up\|running"; then
+              echo "Deployment successful!"
+              docker compose ps
+            else
+              echo "Deployment may have failed. Check container status:"
+              docker compose ps
+              docker compose logs --tail=50
+              exit 1
+            fi
+          EOF
+
+      - name: Notify ntfy (success)
+        if: success()
+        run: |
+          curl -H "Title: BandScan Image API Deployed" \
+               -H "Priority: default" \
+               -d "Image API deployed to production (commit $GITHUB_SHA)" \
+               "$NTFY_URL"
+
+      - name: Notify ntfy (failure)
+        if: failure()
+        run: |
+          curl -H "Title: BandScan Image API FAILED" \
+               -H "Priority: urgent" \
+               -d "Image API deployment failed for commit $GITHUB_SHA. Check workflow logs." \
+               "$NTFY_URL"
