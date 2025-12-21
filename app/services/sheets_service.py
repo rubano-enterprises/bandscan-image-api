@@ -14,14 +14,18 @@ from ..config import get_settings
 logger = logging.getLogger(__name__)
 settings = get_settings()
 
-# Column indices for student list (0-indexed)
+# Column indices for student list (0-indexed) - legacy fallbacks
 COL_NAME = 0  # A
 COL_UID = 1   # B
 COL_INSTRUMENT = 2  # C
 COL_STUDENT_CODE = 8  # I
 COL_REQUESTS = 9  # J
 
-SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+# Scopes for Sheets API and Drive API (for modified time check)
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive.metadata.readonly",
+]
 
 
 def get_credentials():
@@ -42,6 +46,70 @@ def get_sheets_service():
     if not credentials:
         raise ValueError("Google Sheets credentials not configured")
     return build("sheets", "v4", credentials=credentials)
+
+
+def get_drive_service():
+    """Get Google Drive API service (for file metadata)."""
+    credentials = get_credentials()
+    if not credentials:
+        raise ValueError("Google Drive credentials not configured")
+    return build("drive", "v3", credentials=credentials)
+
+
+async def get_spreadsheet_modified_time(spreadsheet_id: str) -> Optional[str]:
+    """
+    Get the last modified time of a spreadsheet.
+    Returns ISO format string or None if not found.
+    """
+    try:
+        service = get_drive_service()
+        result = service.files().get(
+            fileId=spreadsheet_id,
+            fields="modifiedTime"
+        ).execute()
+        return result.get("modifiedTime")
+    except Exception as e:
+        logger.error(f"Error getting spreadsheet modified time: {e}")
+        return None
+
+
+def parse_header_columns(header_row: list) -> dict:
+    """
+    Parse header row to find column indices for each field.
+    Returns dict mapping field name to column index.
+    Handles various naming conventions.
+    """
+    column_map = {}
+    header_lower = [h.lower().strip() if h else "" for h in header_row]
+
+    # Name column - typically first column
+    for i, h in enumerate(header_lower):
+        if h in ("name", "student name", "full name", "student"):
+            column_map["name"] = i
+            break
+    if "name" not in column_map and header_row:
+        column_map["name"] = 0  # Default to first column
+
+    # Instrument column
+    for i, h in enumerate(header_lower):
+        if h in ("instrument", "instruments", "section", "part"):
+            column_map["instrument"] = i
+            break
+
+    # UID column (NFC tag)
+    for i, h in enumerate(header_lower):
+        if h in ("uid", "nfc", "nfc uid", "tag", "tag uid", "nfc tag"):
+            column_map["uid"] = i
+            break
+
+    # Student code column
+    for i, h in enumerate(header_lower):
+        if h in ("code", "student code", "auth code", "qr", "qr code", "login code"):
+            column_map["student_code"] = i
+            break
+
+    logger.debug(f"Parsed column map: {column_map}")
+    return column_map
 
 
 async def find_student_row(
@@ -329,12 +397,14 @@ async def get_all_students_from_sheet(
 ) -> list[dict]:
     """
     Get all students from a Google Sheet.
-    Returns list of dicts with name, uid, and student_code.
+    Parses column headers dynamically to find name, instrument, uid, and student_code.
+    Returns list of dicts with name, instrument, uid, and student_code.
     """
     service = get_sheets_service()
 
-    # Read columns A (name), B (UID), and I (student code)
-    range_name = f"{sheet_name}!A:J"
+    # Read columns A through C (covers name, instrument, and possible UID in old format)
+    # This is a lightweight read - we don't need all columns
+    range_name = f"{sheet_name}!A:C"
     result = service.spreadsheets().values().get(
         spreadsheetId=spreadsheet_id,
         range=range_name,
@@ -343,24 +413,43 @@ async def get_all_students_from_sheet(
     rows = result.get("values", [])
     students = []
 
+    if not rows:
+        logger.warning(f"No data found in sheet {sheet_name}")
+        return students
+
+    # Parse header row to find column indices
+    header_row = rows[0] if rows else []
+    column_map = parse_header_columns(header_row)
+
+    name_col = column_map.get("name", 0)
+    instrument_col = column_map.get("instrument")
+    uid_col = column_map.get("uid")
+
     for i, row in enumerate(rows):
         if i == 0:  # Skip header row
             continue
 
-        # Ensure row has enough columns
-        while len(row) < 10:
+        # Pad row if needed
+        while len(row) <= max(name_col, instrument_col or 0, uid_col or 0):
             row.append("")
 
-        name = row[COL_NAME].strip() if row[COL_NAME] else ""
-        uid = row[COL_UID].strip() if len(row) > COL_UID and row[COL_UID] else None
-        student_code = row[COL_STUDENT_CODE].strip() if len(row) > COL_STUDENT_CODE and row[COL_STUDENT_CODE] else None
+        name = row[name_col].strip() if len(row) > name_col and row[name_col] else ""
+        instrument = None
+        uid = None
+
+        if instrument_col is not None and len(row) > instrument_col:
+            instrument = row[instrument_col].strip() if row[instrument_col] else None
+
+        if uid_col is not None and len(row) > uid_col:
+            uid = row[uid_col].strip() if row[uid_col] else None
 
         if name:  # Only include rows with names
             students.append({
                 "name": name,
+                "instrument": instrument if instrument else None,
                 "uid": uid if uid else None,
-                "student_code": student_code if student_code else None,
+                "student_code": None,  # Codes are stored in API only now
             })
 
-    logger.info(f"Found {len(students)} students in sheet {sheet_name}")
+    logger.info(f"Found {len(students)} students in sheet {sheet_name} (columns: {column_map})")
     return students

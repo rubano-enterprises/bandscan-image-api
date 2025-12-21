@@ -105,6 +105,8 @@ CREATE TABLE IF NOT EXISTS schools (
     attendance_template_id TEXT,
     inventory_sheet_id TEXT,
     active_student_list TEXT DEFAULT 'FullBand',
+    last_synced_at TIMESTAMP,
+    sheet_modified_at TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
@@ -133,6 +135,7 @@ CREATE TABLE IF NOT EXISTS students (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     band_id TEXT NOT NULL,
     name TEXT NOT NULL,
+    instrument TEXT,
     uid TEXT,
     student_code TEXT UNIQUE,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -169,6 +172,20 @@ MIGRATION_ADD_IS_PRIMARY = """
 ALTER TABLE images ADD COLUMN is_primary INTEGER DEFAULT 0;
 """
 
+# Migration to add instrument column to students
+MIGRATION_ADD_INSTRUMENT = """
+ALTER TABLE students ADD COLUMN instrument TEXT;
+"""
+
+# Migration to add sync columns to schools
+MIGRATION_ADD_SYNC_COLUMNS = """
+ALTER TABLE schools ADD COLUMN last_synced_at TIMESTAMP;
+"""
+
+MIGRATION_ADD_SHEET_MODIFIED = """
+ALTER TABLE schools ADD COLUMN sheet_modified_at TEXT;
+"""
+
 
 async def init_database():
     """Initialize the database and create tables if needed."""
@@ -188,12 +205,18 @@ async def init_database():
         await db.commit()
 
         # Run migrations for existing databases
-        try:
-            await db.execute(MIGRATION_ADD_IS_PRIMARY)
-            await db.commit()
-        except Exception:
-            # Column already exists
-            pass
+        for migration in [
+            MIGRATION_ADD_IS_PRIMARY,
+            MIGRATION_ADD_INSTRUMENT,
+            MIGRATION_ADD_SYNC_COLUMNS,
+            MIGRATION_ADD_SHEET_MODIFIED,
+        ]:
+            try:
+                await db.execute(migration)
+                await db.commit()
+            except Exception:
+                # Column already exists
+                pass
 
 
 @asynccontextmanager
@@ -724,7 +747,8 @@ async def update_school(band_id: str, **kwargs) -> Optional[dict]:
     allowed_fields = {
         'logo_url', 'short_name', 'primary_color', 'full_name',
         'admin_emails', 'attendance_template_id', 'inventory_sheet_id',
-        'active_student_list', 'student_list_spreadsheet_id'
+        'active_student_list', 'student_list_spreadsheet_id',
+        'last_synced_at', 'sheet_modified_at'
     }
     updates = {k: v for k, v in kwargs.items() if k in allowed_fields}
     if not updates:
@@ -893,6 +917,7 @@ async def get_all_students(band_id: str) -> List[dict]:
 async def upsert_student(
     band_id: str,
     name: str,
+    instrument: Optional[str] = None,
     uid: Optional[str] = None,
     student_code: Optional[str] = None,
 ) -> dict:
@@ -901,14 +926,15 @@ async def upsert_student(
         now = datetime.utcnow().isoformat()
         await db.execute(
             """
-            INSERT INTO students (band_id, name, uid, student_code, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO students (band_id, name, instrument, uid, student_code, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(band_id, name) DO UPDATE SET
+                instrument = COALESCE(excluded.instrument, students.instrument),
                 uid = COALESCE(excluded.uid, students.uid),
                 student_code = COALESCE(excluded.student_code, students.student_code),
                 updated_at = excluded.updated_at
             """,
-            (band_id, name, uid, student_code, now, now)
+            (band_id, name, instrument, uid, student_code, now, now)
         )
         await db.commit()
     return await get_student_by_name(band_id, name)
@@ -916,7 +942,7 @@ async def upsert_student(
 
 async def update_student(band_id: str, name: str, **kwargs) -> Optional[dict]:
     """Update specific fields of a student."""
-    allowed_fields = {'uid', 'student_code'}
+    allowed_fields = {'uid', 'student_code', 'instrument'}
     updates = {k: v for k, v in kwargs.items() if k in allowed_fields}
     if not updates:
         return await get_student_by_name(band_id, name)
@@ -942,6 +968,20 @@ async def delete_student(band_id: str, name: str) -> bool:
         )
         await db.commit()
         return cursor.rowcount > 0
+
+
+async def delete_students_not_in_list(band_id: str, valid_names: List[str]) -> int:
+    """Delete students not in the given list of names. Returns count deleted."""
+    if not valid_names:
+        return 0
+    async with get_db() as db:
+        placeholders = ",".join("?" * len(valid_names))
+        cursor = await db.execute(
+            f"DELETE FROM students WHERE band_id = ? AND name NOT IN ({placeholders})",
+            (band_id, *valid_names)
+        )
+        await db.commit()
+        return cursor.rowcount
 
 
 async def check_student_code_exists(student_code: str) -> bool:

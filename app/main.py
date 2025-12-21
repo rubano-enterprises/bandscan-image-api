@@ -10,6 +10,7 @@ from .config import get_settings
 from .database import init_database
 from .routes import health, images, items, students, tokens, notifications, schools, requests
 from .services.queue_worker import queue_worker
+from .services.student_sync_worker import student_sync_worker
 
 settings = get_settings()
 
@@ -33,13 +34,18 @@ async def lifespan(app: FastAPI):
     await queue_worker.start()
     logger.info("Queue worker started")
 
+    logger.info("Starting student sync worker...")
+    await student_sync_worker.start()
+    logger.info("Student sync worker started")
+
     logger.info(f"BandScan API starting on {settings.base_url}")
 
     yield
 
     # Shutdown
-    logger.info("Stopping queue worker...")
+    logger.info("Stopping workers...")
     await queue_worker.stop()
+    await student_sync_worker.stop()
     logger.info("BandScan API shutting down")
 
 

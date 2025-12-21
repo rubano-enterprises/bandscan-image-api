@@ -17,6 +17,7 @@ from ..database import (
     upsert_student,
     update_student,
     delete_student,
+    delete_students_not_in_list,
     check_student_code_exists,
     get_school,
 )
@@ -89,6 +90,7 @@ class StudentResponse(BaseModel):
     id: int
     band_id: str
     name: str
+    instrument: Optional[str] = None
     uid: Optional[str] = None
     student_code: Optional[str] = None
     created_at: str
@@ -428,44 +430,50 @@ async def sync_students_from_sheets(
 
         created = 0
         updated = 0
+        valid_names = []
 
         for student in sheet_students:
             name = student.get("name")
             if not name:
                 continue
 
+            valid_names.append(name)
+
             # Check if student already exists
             existing = await get_student_by_name(band_id, name)
 
             if existing:
-                # Update if UID or code differs
+                # Update if instrument changed (don't overwrite UID/code from sheet)
                 needs_update = False
-                updates = {}
 
-                if student.get("uid") and student["uid"] != existing.get("uid"):
-                    updates["uid"] = student["uid"]
-                    needs_update = True
-                if student.get("student_code") and student["student_code"] != existing.get("student_code"):
-                    updates["student_code"] = student["student_code"]
+                if student.get("instrument") and student["instrument"] != existing.get("instrument"):
                     needs_update = True
 
                 if needs_update:
-                    await update_student(band_id, name, **updates)
+                    await upsert_student(
+                        band_id=band_id,
+                        name=name,
+                        instrument=student.get("instrument"),
+                    )
                     updated += 1
             else:
-                # Create new student
+                # Create new student with instrument
                 await upsert_student(
                     band_id=band_id,
                     name=name,
-                    uid=student.get("uid"),
-                    student_code=student.get("student_code"),
+                    instrument=student.get("instrument"),
+                    uid=student.get("uid"),  # May be present in old sheets
                 )
                 created += 1
+
+        # Delete students no longer in sheet
+        deleted = await delete_students_not_in_list(band_id, valid_names)
 
         return {
             "success": True,
             "created": created,
             "updated": updated,
+            "deleted": deleted,
             "total_in_sheet": len(sheet_students),
         }
 
