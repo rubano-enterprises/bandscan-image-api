@@ -321,3 +321,46 @@ async def update_student_instrument(
     logger.info(f"Updated instrument for {student_name} at row {row}: {new_instrument}")
 
     return True
+
+
+async def get_all_students_from_sheet(
+    spreadsheet_id: str,
+    sheet_name: str,
+) -> list[dict]:
+    """
+    Get all students from a Google Sheet.
+    Returns list of dicts with name, uid, and student_code.
+    """
+    service = get_sheets_service()
+
+    # Read columns A (name), B (UID), and I (student code)
+    range_name = f"{sheet_name}!A:J"
+    result = service.spreadsheets().values().get(
+        spreadsheetId=spreadsheet_id,
+        range=range_name,
+    ).execute()
+
+    rows = result.get("values", [])
+    students = []
+
+    for i, row in enumerate(rows):
+        if i == 0:  # Skip header row
+            continue
+
+        # Ensure row has enough columns
+        while len(row) < 10:
+            row.append("")
+
+        name = row[COL_NAME].strip() if row[COL_NAME] else ""
+        uid = row[COL_UID].strip() if len(row) > COL_UID and row[COL_UID] else None
+        student_code = row[COL_STUDENT_CODE].strip() if len(row) > COL_STUDENT_CODE and row[COL_STUDENT_CODE] else None
+
+        if name:  # Only include rows with names
+            students.append({
+                "name": name,
+                "uid": uid if uid else None,
+                "student_code": student_code if student_code else None,
+            })
+
+    logger.info(f"Found {len(students)} students in sheet {sheet_name}")
+    return students

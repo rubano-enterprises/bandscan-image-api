@@ -18,6 +18,7 @@ from ..database import (
     update_student,
     delete_student,
     check_student_code_exists,
+    get_school,
 )
 from ..services import sheets_service
 
@@ -388,3 +389,88 @@ async def check_code_exists(
     """Check if a student code exists (globally unique)."""
     exists = await check_student_code_exists(code)
     return {"code": code, "exists": exists}
+
+
+@router.post("/{band_id}/sync")
+async def sync_students_from_sheets(
+    band_id: str,
+    _: str = Depends(verify_token),
+):
+    """
+    Sync students from Google Sheets to API database.
+
+    Reads all students from the school's student list spreadsheet
+    and creates/updates API records for each student.
+    """
+    # Get school info
+    school = await get_school(band_id)
+    if not school:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"School '{band_id}' not found"
+        )
+
+    spreadsheet_id = school.get("student_list_spreadsheet_id")
+    active_list = school.get("active_student_list", "FullBand")
+
+    if not spreadsheet_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="School has no student list spreadsheet configured"
+        )
+
+    try:
+        # Get all students from sheet
+        sheet_students = await sheets_service.get_all_students_from_sheet(
+            spreadsheet_id=spreadsheet_id,
+            sheet_name=active_list,
+        )
+
+        created = 0
+        updated = 0
+
+        for student in sheet_students:
+            name = student.get("name")
+            if not name:
+                continue
+
+            # Check if student already exists
+            existing = await get_student_by_name(band_id, name)
+
+            if existing:
+                # Update if UID or code differs
+                needs_update = False
+                updates = {}
+
+                if student.get("uid") and student["uid"] != existing.get("uid"):
+                    updates["uid"] = student["uid"]
+                    needs_update = True
+                if student.get("student_code") and student["student_code"] != existing.get("student_code"):
+                    updates["student_code"] = student["student_code"]
+                    needs_update = True
+
+                if needs_update:
+                    await update_student(band_id, name, **updates)
+                    updated += 1
+            else:
+                # Create new student
+                await upsert_student(
+                    band_id=band_id,
+                    name=name,
+                    uid=student.get("uid"),
+                    student_code=student.get("student_code"),
+                )
+                created += 1
+
+        return {
+            "success": True,
+            "created": created,
+            "updated": updated,
+            "total_in_sheet": len(sheet_students),
+        }
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to sync students: {str(e)}"
+        )
